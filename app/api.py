@@ -123,15 +123,19 @@ def find_best_insight(
     best_prompt_list = []
     sims_debug = []
 
-    # Map cluster_id to cluster prompts for quick lookup
-    cluster_prompts_by_id = {c["cluster_id"]: [s["content"] for s in c["snapshots"]] for c in clusters}
+    # Map cluster_id to cluster prompts for quick lookup (normalize to int)
+    cluster_prompts_by_id = {}
+    for c in clusters:
+        # cluster_id can be int or str, normalize to int for safe matching
+        cid = int(c["cluster_id"])
+        cluster_prompts_by_id[cid] = [s["content"] for s in c["snapshots"]]
 
     for insight in insights:
-        cluster_id = insight["cluster"]
+        cluster_id = int(insight["cluster"])  # normalize to int for matching!
         cluster_prompts = cluster_prompts_by_id.get(cluster_id, [])
         sim_scores = []
 
-        # Compare prompt to each prompt in the cluster
+        # Compare prompt to each prompt in this cluster
         for p in cluster_prompts:
             sim = cosine_similarity(prompt_emb, get_embedding(p))
             sim_scores.append(sim)
