@@ -108,35 +108,74 @@ def extract_keywords_from_insight(insight_text):
         return keywords.strip(" .:-").lower()
     return insight_text.lower()
 
-def find_best_insight(prompt: str, insights: List[Dict], cluster_centroids=None, threshold: float = 0.5):
+# --- REVISED CLUSTER MATCHING FUNCTION ---
+def find_best_insight(
+    prompt: str,
+    insights: List[Dict],
+    clusters: List[Dict],
+    get_embedding,
+    threshold: float = 0.5,
+):
     prompt_emb = get_embedding(prompt)
-    best_idx, best_sim = None, 0.0
+    best_sim = 0.0
+    best_insight_obj = None
+    best_cluster_id = None
+    best_prompt_list = []
     sims_debug = []
-    for idx, cluster in enumerate(insights):
-        insight_text = cluster.get("insight", "")
-        if not insight_text:
-            continue
-        # Use both keywords and cluster centroid
-        keywords = extract_keywords_from_insight(insight_text)
-        insight_emb = get_embedding(keywords)
-        sim_kw = cosine_similarity(prompt_emb, insight_emb)
-        sim_cen = 0.0
-        if cluster_centroids and idx in cluster_centroids:
-            sim_cen = cosine_similarity(prompt_emb, cluster_centroids[idx])
-        sim = max(sim_kw, sim_cen)
-        sims_debug.append((keywords, sim_kw, sim_cen, sim))
-        if sim > best_sim:
-            best_sim = sim
-            best_idx = idx
-    # Debug print similarities
+
+    # Map cluster_id to cluster prompts for quick lookup
+    cluster_prompts_by_id = {c["cluster_id"]: [s["content"] for s in c["snapshots"]] for c in clusters}
+
+    for insight in insights:
+        cluster_id = insight["cluster"]
+        cluster_prompts = cluster_prompts_by_id.get(cluster_id, [])
+        sim_scores = []
+
+        # Compare prompt to each prompt in the cluster
+        for p in cluster_prompts:
+            sim = cosine_similarity(prompt_emb, get_embedding(p))
+            sim_scores.append(sim)
+
+        # Also compare to keywords embedding from insight
+        keywords = extract_keywords_from_insight(insight["insight"])
+        kw_emb = get_embedding(keywords)
+        kw_sim = cosine_similarity(prompt_emb, kw_emb)
+        all_sims = sim_scores + [kw_sim]
+        max_sim = max(all_sims) if all_sims else 0.0
+
+        sims_debug.append({
+            "cluster_id": cluster_id,
+            "sim_scores": sim_scores,
+            "keywords": keywords,
+            "kw_sim": kw_sim,
+            "max_sim": max_sim,
+            "prompts": cluster_prompts,
+        })
+
+        if max_sim > best_sim:
+            best_sim = max_sim
+            best_insight_obj = insight
+            best_cluster_id = cluster_id
+            best_prompt_list = cluster_prompts
+
     print("\n[SIMILARITY DEBUG] Prompt:", prompt)
-    for i, (text, sim_kw, sim_cen, sim) in enumerate(sims_debug):
-        print(f"  Insight {i}: sim_kw={sim_kw:.3f} sim_centroid={sim_cen:.3f} FINAL={sim:.3f} | insight_keywords={text!r}")
+    for d in sims_debug:
+        print(
+            f"  Cluster {d['cluster_id']}: "
+            f"max_sim={d['max_sim']:.3f} | "
+            f"keywords={d['keywords']!r} | "
+            f"prompt_sims={[round(x,3) for x in d['sim_scores']]} | "
+            f"kw_sim={d['kw_sim']:.3f}"
+        )
+
     global_state["similarity_debug_log"].append({
         "prompt": prompt,
-        "sims": [{ "idx": i, "sim_kw": float(sim_kw), "sim_centroid": float(sim_cen), "sim": float(sim), "insight_keywords": text} for i, (text, sim_kw, sim_cen, sim) in enumerate(sims_debug)]
+        "clusters": sims_debug
     })
-    return (best_idx, best_sim) if best_sim >= threshold else (None, best_sim)
+
+    if best_sim >= threshold:
+        return best_insight_obj, best_sim, best_cluster_id, best_prompt_list
+    return None, best_sim, None, []
 
 @app.post("/generate/")
 async def generate(item: GenerateRequest, embedding_mode: Optional[str] = Query(None)):
@@ -165,7 +204,6 @@ async def generate(item: GenerateRequest, embedding_mode: Optional[str] = Query(
         clusters = adaptive_kmeans(embeddings)
         memory.update_clusters(clusters)
 
-        # Each cluster with explicit cluster_id and organized prompt contents
         clusters_for_insight = []
         for cluster_id, indices in clusters.items():
             clusters_for_insight.append({
@@ -191,24 +229,30 @@ async def generate(item: GenerateRequest, embedding_mode: Optional[str] = Query(
     output = None
     match_log_entry = {}
     memory_layer = global_state.get("memory_augmented_insights", [])
-    cluster_centroids = getattr(memory, 'centroids', None)
-    best_idx, best_sim = None, 0.0
-    best_insight = None
+    clusters = global_state.get("last_clusters", [])
+    best_insight_obj, best_sim, best_cluster_id, best_prompt_list = None, 0.0, None, []
 
     # Only allow augmentation if clustering happened (after 10 prompts and insights are in memory)
     if memory_layer and len(memory.snapshots) >= CLUSTERING_THRESHOLD:
-        best_idx, best_sim = find_best_insight(item.prompt, memory_layer, cluster_centroids)
-        if best_idx is not None:
-            best_insight = memory_layer[best_idx]["insight"]
+        best_insight_obj, best_sim, best_cluster_id, best_prompt_list = find_best_insight(
+            item.prompt, memory_layer, clusters, get_embedding
+        )
 
-    if best_insight:
-        aug_prompt = f"{best_insight}\nUser: {item.prompt}\nAnswer:"
+    if best_insight_obj:
+        # Provide the matched cluster's insight and up to 5 prompt examples for better LLM context
+        cluster_examples = "\n".join(f"- {p}" for p in best_prompt_list[:5])
+        aug_prompt = (
+            f"{best_insight_obj['insight']}\n"
+            f"Here are related user queries for context:\n{cluster_examples}\n"
+            f"User: {item.prompt}\nAnswer:"
+        )
         output = query_gemma(aug_prompt)
         match_log_entry = {
             "memory_augmented": True,
-            "cluster_idx": best_idx,
+            "cluster_idx": best_cluster_id,
             "similarity": best_sim,
-            "used_insight": best_insight,
+            "used_insight": best_insight_obj["insight"],
+            "cluster_examples": best_prompt_list[:5],
             "output": output,
             "timestamp": time.time(),
         }
@@ -216,7 +260,7 @@ async def generate(item: GenerateRequest, embedding_mode: Optional[str] = Query(
         output = query_gemma(item.prompt)
         match_log_entry = {
             "memory_augmented": False,
-            "reason": "No memory match or memory layer empty or not after 10th prompt",
+            "reason": "No suitable cluster match or memory layer empty or not after 10th prompt",
             "output": output,
             "timestamp": time.time(),
         }
@@ -273,7 +317,6 @@ async def generate_insights():
 
 @app.post("/augment_memory/")
 async def augment_memory():
-    # Only after 10th prompt
     if len(memory.snapshots) < CLUSTERING_THRESHOLD:
         return {"error": f"Memory augmentation only allowed after {CLUSTERING_THRESHOLD} prompts."}
     latest = global_state.get("last_insights", [])
