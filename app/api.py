@@ -38,6 +38,10 @@ global_state = {
     "correction_log": [],
     "cluster_match_log": [],
     "similarity_debug_log": [],
+    # NEW: Stable cluster tracking
+    "cluster_centroids": {},  # Store centroids for stable cluster matching
+    "next_cluster_id": 0,     # Counter for generating unique cluster IDs
+    "cluster_history": [],    # Track cluster evolution
 }
 
 def reset_memory():
@@ -60,6 +64,10 @@ def reset_memory():
         "correction_log": [],
         "cluster_match_log": [],
         "similarity_debug_log": [],
+        # Reset stable cluster tracking
+        "cluster_centroids": {},
+        "next_cluster_id": 0,
+        "cluster_history": [],
     })
 
 class GenerateRequest(BaseModel):
@@ -76,6 +84,88 @@ def cosine_similarity(a, b):
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return float(np.dot(a, b) / (norm_a * norm_b + 1e-8))
+
+def compute_cluster_centroid(snapshot_indices, memory_snapshots):
+    """Compute the centroid embedding for a cluster"""
+    if not snapshot_indices:
+        return None
+    
+    embeddings = []
+    for idx in snapshot_indices:
+        if idx < len(memory_snapshots):
+            embedding = get_embedding(memory_snapshots[idx].content)
+            embeddings.append(embedding)
+    
+    if not embeddings:
+        return None
+    
+    return np.mean(embeddings, axis=0)
+
+def match_clusters_to_stable_ids(new_clusters, memory_snapshots, stored_centroids, threshold=0.7):
+    """
+    Match new clustering results to existing stable cluster IDs based on centroid similarity
+    Returns a mapping from new_cluster_id -> stable_cluster_id
+    """
+    if not stored_centroids:
+        # First time clustering - assign new stable IDs
+        stable_mapping = {}
+        new_centroids = {}
+        
+        for new_id, indices in new_clusters.items():
+            stable_id = global_state["next_cluster_id"]
+            global_state["next_cluster_id"] += 1
+            
+            stable_mapping[new_id] = stable_id
+            centroid = compute_cluster_centroid(indices, memory_snapshots)
+            if centroid is not None:
+                new_centroids[stable_id] = centroid
+        
+        global_state["cluster_centroids"] = new_centroids
+        return stable_mapping
+    
+    # Match new clusters to existing stable clusters
+    stable_mapping = {}
+    new_centroids = {}
+    used_stable_ids = set()
+    
+    # Compute centroids for new clusters
+    new_cluster_centroids = {}
+    for new_id, indices in new_clusters.items():
+        centroid = compute_cluster_centroid(indices, memory_snapshots)
+        if centroid is not None:
+            new_cluster_centroids[new_id] = centroid
+    
+    # Find best matches between new clusters and existing stable clusters
+    for new_id, new_centroid in new_cluster_centroids.items():
+        best_match_id = None
+        best_similarity = 0.0
+        
+        for stable_id, stored_centroid in stored_centroids.items():
+            if stable_id in used_stable_ids:
+                continue
+                
+            similarity = cosine_similarity(new_centroid, stored_centroid)
+            if similarity > best_similarity and similarity >= threshold:
+                best_similarity = similarity
+                best_match_id = stable_id
+        
+        if best_match_id is not None:
+            stable_mapping[new_id] = best_match_id
+            used_stable_ids.add(best_match_id)
+            new_centroids[best_match_id] = new_centroid
+            print(f"[CLUSTER_MATCH] New cluster {new_id} matched to stable cluster {best_match_id} (sim={best_similarity:.3f})")
+        else:
+            # Create new stable cluster ID
+            new_stable_id = global_state["next_cluster_id"]
+            global_state["next_cluster_id"] += 1
+            stable_mapping[new_id] = new_stable_id
+            new_centroids[new_stable_id] = new_centroid
+            print(f"[CLUSTER_MATCH] New cluster {new_id} assigned new stable ID {new_stable_id}")
+    
+    # Update stored centroids
+    global_state["cluster_centroids"] = new_centroids
+    
+    return stable_mapping
 
 def to_jsonable(obj):
     if isinstance(obj, (np.integer,)):
@@ -108,7 +198,6 @@ def extract_keywords_from_insight(insight_text):
         return keywords.strip(" .:-").lower()
     return insight_text.lower()
 
-# --- FIXED CLUSTER MATCH FUNCTION ---
 def find_best_insight(
     prompt: str,
     insights: List[Dict],
@@ -127,29 +216,17 @@ def find_best_insight(
     best_prompt_list = []
     match_reason = None
 
-    # Create a more robust cluster mapping - handle both string and int cluster_ids
+    # Create cluster mapping using stable cluster IDs
     cluster_prompts_by_id = {}
     for c in clusters:
         cluster_id = c.get("cluster_id")
         if cluster_id is not None:
-            # Normalize cluster_id to string for consistent comparison
             cluster_id_str = str(cluster_id)
             cluster_prompts_by_id[cluster_id_str] = [s["content"] for s in c.get("snapshots", [])]
 
     print(f"[DEBUG] Available cluster IDs: {list(cluster_prompts_by_id.keys())}")
     print(f"[DEBUG] Insight cluster IDs: {[str(insight.get('cluster', 'N/A')) for insight in insights]}")
     
-    # Debug: Print the actual cluster contents and insights for verification
-    print("[DEBUG] CLUSTER CONTENTS:")
-    for cluster_id, prompts in cluster_prompts_by_id.items():
-        print(f"  Cluster {cluster_id}: {prompts}")
-    
-    print("[DEBUG] INSIGHTS:")
-    for insight in insights:
-        cluster_id = insight.get("cluster")
-        insight_text = insight.get("insight", "")[:100]
-        print(f"  Cluster {cluster_id}: {insight_text}...")
-
     sims_debug = []
 
     for insight in insights:
@@ -158,7 +235,6 @@ def find_best_insight(
             print(f"[WARNING] Insight missing cluster ID: {insight}")
             continue
             
-        # Normalize to string for comparison
         insight_cluster_id_str = str(insight_cluster_id)
         cluster_prompts = cluster_prompts_by_id.get(insight_cluster_id_str, [])
         
@@ -213,7 +289,7 @@ def find_best_insight(
         if kw_sim >= threshold and kw_sim > best_sim:
             best_sim = kw_sim
             best_insight_obj = insight
-            best_cluster_id = insight_cluster_id_str  # Keep as string for consistency
+            best_cluster_id = insight_cluster_id_str
             best_prompt_list = cluster_prompts
             match_reason = "keyword"
             print(f"[DEBUG] New best keyword match: cluster {insight_cluster_id_str}, sim={kw_sim:.3f}")
@@ -222,7 +298,7 @@ def find_best_insight(
         elif sim_scores and max_prompt_sim > 0.95 and max_prompt_sim > best_sim and best_sim < threshold:
             best_sim = max_prompt_sim
             best_insight_obj = insight
-            best_cluster_id = insight_cluster_id_str  # Keep as string for consistency
+            best_cluster_id = insight_cluster_id_str
             best_prompt_list = cluster_prompts
             match_reason = "prompt"
             print(f"[DEBUG] New best prompt match: cluster {insight_cluster_id_str}, sim={max_prompt_sim:.3f}")
@@ -272,44 +348,75 @@ async def generate(item: GenerateRequest, embedding_mode: Optional[str] = Query(
     memory.add_snapshot(snap)
     global_state["prompt_count"] += 1
 
-    # --- CLUSTERING LOGIC ---
+    # --- ENHANCED CLUSTERING LOGIC WITH STABLE IDs ---
     do_clustering = memory.needs_clustering()
     if do_clustering:
         embeddings = memory.get_embeddings()
-        clusters = adaptive_kmeans(embeddings)
-        memory.update_clusters(clusters)
+        raw_clusters = adaptive_kmeans(embeddings)
+        
+        # Map raw cluster IDs to stable cluster IDs
+        stable_mapping = match_clusters_to_stable_ids(
+            raw_clusters, 
+            memory.snapshots, 
+            global_state["cluster_centroids"]
+        )
+        
+        # Apply stable mapping to clusters
+        stable_clusters = {}
+        for raw_id, indices in raw_clusters.items():
+            stable_id = stable_mapping.get(raw_id, raw_id)
+            stable_clusters[stable_id] = indices
+        
+        memory.update_clusters(stable_clusters)
 
+        # Create clusters for insight generation using stable IDs
         clusters_for_insight = []
-        for cluster_id, indices in clusters.items():
-            # Ensure cluster_id is consistently handled
+        for stable_cluster_id, indices in stable_clusters.items():
             cluster_data = {
-                "cluster_id": str(cluster_id),  # Normalize to string
+                "cluster_id": str(stable_cluster_id),
                 "snapshots": [
                     {
                         "content": memory.snapshots[i].content,
                         "time": readable_time(memory.snapshots[i].timestamp)
                     }
-                    for i in indices if i < len(memory.snapshots)  # Safety check
+                    for i in indices if i < len(memory.snapshots)
                 ],
             }
             clusters_for_insight.append(cluster_data)
 
-        print("CLUSTER DEBUG:", {k: [memory.snapshots[i].content for i in idxs if i < len(memory.snapshots)] for k, idxs in clusters.items()})
+        # Log cluster history for debugging
+        history_entry = {
+            "timestamp": time.time(),
+            "prompt_count": global_state["prompt_count"],
+            "raw_clusters": {str(k): [memory.snapshots[i].content for i in v if i < len(memory.snapshots)] for k, v in raw_clusters.items()},
+            "stable_mapping": stable_mapping,
+            "stable_clusters": {str(k): [memory.snapshots[i].content for i in v if i < len(memory.snapshots)] for k, v in stable_clusters.items()}
+        }
+        global_state["cluster_history"].append(history_entry)
+
+        print("CLUSTER DEBUG (Stable):", {k: [memory.snapshots[i].content for i in idxs if i < len(memory.snapshots)] for k, idxs in stable_clusters.items()})
+        print("CLUSTER MAPPING:", stable_mapping)
+        
         global_state["last_clusters"] = clusters_for_insight
         global_state["last_snapshots"] = memory.snapshots[-CLUSTERING_THRESHOLD:]
         global_state["last_cluster_objs"] = clusters_for_insight
         global_state["last_snapshot_lists"] = [c["snapshots"] for c in clusters_for_insight]
-        global_state["can_generate_insights"] = True
-        global_state["insights_generated_for_this_clustering"] = False
+        
+        # Only allow new insight generation if we haven't generated insights yet
+        # OR if this is a completely new clustering (first time after reset)
+        if not global_state.get("memory_augmented_insights"):
+            global_state["can_generate_insights"] = True
+            global_state["insights_generated_for_this_clustering"] = False
+        else:
+            print("[DEBUG] Insights already exist - using existing insights with stable cluster IDs")
 
-    # --- MEMORY AUGMENTATION LOGIC ---
+    # --- MEMORY AUGMENTATION LOGIC (unchanged) ---
     output = None
     match_log_entry = {}
     memory_layer = global_state.get("memory_augmented_insights", [])
     clusters = global_state.get("last_clusters", [])
     best_insight_obj, best_sim, best_cluster_id, best_prompt_list, match_reason = None, 0.0, None, [], None
 
-    # Only allow augmentation if clustering happened (after 10 prompts and insights are in memory)
     if memory_layer and len(memory.snapshots) >= CLUSTERING_THRESHOLD:
         try:
             best_insight_obj, best_sim, best_cluster_id, best_prompt_list, match_reason = find_best_insight(
@@ -320,7 +427,6 @@ async def generate(item: GenerateRequest, embedding_mode: Optional[str] = Query(
             best_insight_obj = None
 
     if best_insight_obj:
-        # Provide the matched cluster's insight and up to 5 prompt examples for better LLM context
         cluster_examples = "\n".join(f"- {p}" for p in best_prompt_list[:5])
         aug_prompt = (
             f"{best_insight_obj['insight']}\n"
@@ -337,7 +443,7 @@ async def generate(item: GenerateRequest, embedding_mode: Optional[str] = Query(
             "match_reason": match_reason,
             "output": output,
             "timestamp": time.time(),
-            "prompt": item.prompt,  # Add for debugging
+            "prompt": item.prompt,
         }
     else:
         output = query_gemma(item.prompt)
@@ -346,7 +452,7 @@ async def generate(item: GenerateRequest, embedding_mode: Optional[str] = Query(
             "reason": "No suitable cluster match or memory layer empty or not after 10th prompt",
             "output": output,
             "timestamp": time.time(),
-            "prompt": item.prompt,  # Add for debugging
+            "prompt": item.prompt,
         }
 
     global_state["cluster_match_log"].append(match_log_entry)
@@ -371,7 +477,8 @@ async def generate(item: GenerateRequest, embedding_mode: Optional[str] = Query(
         "insights_generated": global_state["insights_generated_for_this_clustering"],
         "insights": global_state.get("last_insights", []),
         "match_log": match_log_entry,
-        "embedding_mode": global_embedding_mode
+        "embedding_mode": global_embedding_mode,
+        "stable_cluster_count": len(global_state["cluster_centroids"])
     })
 
 @app.post("/generate_insights/")
@@ -383,13 +490,13 @@ async def generate_insights():
         return {"error": "No clusters available. Generate more prompts."}
     insights = []
     
-    print("[DEBUG] Generating insights for clusters:")
+    print("[DEBUG] Generating insights for stable clusters:")
     for cluster in clusters:
         cluster_id = cluster["cluster_id"]
         snaps = cluster["snapshots"]
         topics = [snap["content"] for snap in snaps][:10]
         
-        print(f"[DEBUG] Cluster {cluster_id} topics: {topics}")
+        print(f"[DEBUG] Stable Cluster {cluster_id} topics: {topics}")
         
         prompt = (
             f"Given these user queries: {topics}\n"
@@ -399,35 +506,19 @@ async def generate_insights():
         insight = query_gemma(prompt)
         
         insight_obj = {
-            "cluster": str(cluster_id),  # Ensure string consistency
+            "cluster": str(cluster_id),  # Use stable cluster ID
             "insight": insight, 
             "prompts": topics
         }
         insights.append(insight_obj)
         
-        print(f"[DEBUG] Generated insight for cluster {cluster_id}: {insight[:100]}...")
-        print(f"[DEBUG] Cluster {cluster_id} prompts stored: {topics}")
+        print(f"[DEBUG] Generated insight for stable cluster {cluster_id}: {insight[:100]}...")
     
     global_state["insights_generated_for_this_clustering"] = True
     global_state["can_generate_insights"] = False
     global_state["last_insights"] = insights
     
-    # Validation: Check that insights match their clusters
-    print("[DEBUG] VALIDATION - Insight-Cluster mapping:")
-    current_clusters = global_state.get("last_clusters", [])
-    cluster_lookup = {str(c["cluster_id"]): [s["content"] for s in c["snapshots"]] for c in current_clusters}
-    
-    for insight_obj in insights:
-        insight_cluster_id = insight_obj["cluster"]
-        actual_prompts = cluster_lookup.get(insight_cluster_id, [])
-        stored_prompts = insight_obj["prompts"]
-        
-        print(f"[VALIDATION] Cluster {insight_cluster_id}:")
-        print(f"  Actual cluster prompts: {actual_prompts}")
-        print(f"  Stored in insight: {stored_prompts}")
-        print(f"  Match: {set(actual_prompts) == set(stored_prompts)}")
-    
-    print("[DEBUG] Final cluster insights:", [f"Cluster {i['cluster']}: {i['insight'][:50]}..." for i in insights])
+    print("[DEBUG] Final stable cluster insights:", [f"Cluster {i['cluster']}: {i['insight'][:50]}..." for i in insights])
     return to_jsonable({"cluster_insights": insights})
 
 @app.post("/augment_memory/")
@@ -438,7 +529,7 @@ async def augment_memory():
     if not latest:
         return {"error": "No insights to augment. Generate insights first."}
     global_state["memory_augmented_insights"] = latest.copy()
-    print("[DEBUG] memory_augmented_insights updated:", [f"Cluster {i['cluster']}: {i['insight']}" for i in latest])
+    print("[DEBUG] memory_augmented_insights updated with stable cluster IDs:", [f"Cluster {i['cluster']}: {i['insight']}" for i in latest])
     return {"augmented_count": len(latest)}
 
 @app.get("/correction_log/")
@@ -452,6 +543,11 @@ async def get_match_log():
 @app.get("/similarity_debug_log/")
 async def get_similarity_debug_log():
     return to_jsonable({"similarity_debug_log": global_state["similarity_debug_log"]})
+
+@app.get("/cluster_history/")
+async def get_cluster_history():
+    """New endpoint to track cluster evolution over time"""
+    return to_jsonable({"cluster_history": global_state["cluster_history"]})
 
 @app.get("/embedding_mode/")
 async def get_embedding_mode(mode: Optional[str] = None):
@@ -467,15 +563,19 @@ async def manual_reset():
 
 @app.get("/validate_clusters/")
 async def validate_clusters():
-    """Debug endpoint to validate cluster-insight alignment"""
+    """Enhanced validation with stable cluster tracking"""
     clusters = global_state.get("last_clusters", [])
     insights = global_state.get("memory_augmented_insights", [])
+    centroids = global_state.get("cluster_centroids", {})
     
     validation_report = {
         "clusters_count": len(clusters),
         "insights_count": len(insights),
+        "stable_centroids_count": len(centroids),
+        "next_cluster_id": global_state.get("next_cluster_id", 0),
         "cluster_details": [],
         "insight_details": [],
+        "centroid_details": [],
         "mismatches": []
     }
     
@@ -499,6 +599,14 @@ async def validate_clusters():
             "insight": insight_text[:100] + "..." if len(insight_text) > 100 else insight_text,
             "stored_prompts": stored_prompts,
             "stored_prompt_count": len(stored_prompts)
+        })
+    
+    # Collect centroid details
+    for centroid_id, centroid in centroids.items():
+        validation_report["centroid_details"].append({
+            "cluster_id": str(centroid_id),
+            "centroid_exists": centroid is not None,
+            "centroid_shape": np.array(centroid).shape if centroid is not None else None
         })
     
     # Check for mismatches
