@@ -520,3 +520,36 @@ async def validate_clusters():
             })
 
     return to_jsonable(validation_report)
+
+@app.post("/generate_no_layer/")
+async def generate_no_layer(item: GenerateRequest, embedding_mode: Optional[str] = Query(None)):
+    """
+    Bypasses all memory/insight logic, simply calls the LLM directly.
+    """
+    global global_embedding_mode
+    if embedding_mode and embedding_mode in EMBEDDING_MODES:
+        global_embedding_mode = embedding_mode
+
+    output = query_gemma(item.prompt)  # Direct call, no memory logic
+
+    # Log the response if you want to analyze later
+    match_log_entry = {
+        "memory_augmented": False,
+        "reason": "Direct LLM call, no memory/insight used",
+        "output": output,
+        "timestamp": time.time(),
+        "prompt": item.prompt,
+    }
+    global_state["cluster_match_log"].append(match_log_entry)
+
+    return to_jsonable({
+        "response": output,
+        "last_10_snapshots": [],
+        "clusters": [],
+        "can_generate_insights": False,
+        "insights_generated": False,
+        "insights": [],
+        "match_log": match_log_entry,
+        "embedding_mode": global_embedding_mode,
+        "stable_cluster_count": 0
+    })

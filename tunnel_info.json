@@ -1,0 +1,7 @@
+{
+  "public_url": "http://localhost:8000",
+  "swagger_url": "http://localhost:8000/docs",
+  "api_base_url": "http://localhost:8000",
+  "created_at": 1754116244.9865189,
+  "note": "Running locally without ngrok tunnel"
+}
