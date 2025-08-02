@@ -49,7 +49,7 @@ def find_request_body_input(section):
             return section.find_element(By.CSS_SELECTOR, 'div[contenteditable="true"]')
         except NoSuchElementException:
             return None
-
+#what if there is no textarea?
 def clear_and_fill_textarea(textarea, new_text):
     try:
         textarea.click()
